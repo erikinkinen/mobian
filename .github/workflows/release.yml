@@ -1,0 +1,206 @@
+name: mobian rootfs-builder
+
+on:
+  workflow_dispatch:
+  push:
+  schedule:
+    - cron: "59 23 * * *"
+
+jobs:
+  rootfs:
+    runs-on: ubuntu-20.04
+
+    strategy:
+      fail-fast: true
+      matrix:
+        architecture: [ "arm64" ]
+        environment: [ "phosh" ]
+
+    name: build ${{ matrix.architecture }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          lfs: 'true'
+          submodules: 'recursive'
+
+      - name: Checkout submodules
+        run: git submodule update --init --recursive
+
+      - name: QEMU set-up
+        uses: docker/setup-qemu-action@v1
+
+      - name: Pull container
+        run: docker pull quay.io/droidian/rootfs-builder:trixie-amd64
+
+      - name: Start Container
+        run: echo CONTAINER_HASH=$(docker run --detach --privileged -v /dev:/host-dev -v /sys/fs/cgroup:/sys/fs/cgroup -v ${PWD}:/buildd/sources --security-opt seccomp:unconfined quay.io/droidian/rootfs-builder:trixie-amd64 /sbin/init) >> $GITHUB_ENV
+
+      - name: Build rootfs
+        run: |
+          docker exec $CONTAINER_HASH /bin/sh -c 'cd /buildd/sources; debos --disable-fakemachine -t architecture:"${{ matrix.architecture }}" -t environment:"${{ matrix.environment }}" rootfs.yaml'
+
+      - name: Build installfs
+        run: |
+          docker exec $CONTAINER_HASH /bin/sh -c 'cd /buildd/sources; debos --disable-fakemachine -t architecture:"${{ matrix.architecture }}" -t environment:"${{ matrix.environment }}" installfs.yaml'
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          path: |
+            rootfs.tar.gz
+            installfs.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+  build:
+    runs-on: ubuntu-20.04
+
+    strategy:
+      fail-fast: true
+      matrix:
+        device: [ ["pinephone", "sunxi", "arm64"] ]
+        environment: [ "phosh" ]
+
+    name: build ${{ matrix.device[0] }}
+    needs: rootfs
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          lfs: 'true'
+          submodules: 'recursive'
+
+      - name: Checkout submodules
+        run: git submodule update --init --recursive
+
+      - name: QEMU set-up
+        uses: docker/setup-qemu-action@v1
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v3
+
+      - name: Pull container
+        run: docker pull quay.io/droidian/rootfs-builder:trixie-amd64
+
+      - name: Start Container
+        run: echo CONTAINER_HASH=$(docker run --detach --privileged -v /dev:/host-dev -v /sys/fs/cgroup:/sys/fs/cgroup -v ${PWD}:/buildd/sources --security-opt seccomp:unconfined quay.io/droidian/rootfs-builder:trixie-amd64 /sbin/init) >> $GITHUB_ENV
+
+      - name: Build rootfs-device
+        run: |
+          docker exec $CONTAINER_HASH /bin/sh -c 'cd /buildd/sources; debos --disable-fakemachine -t device:"${{ matrix.device[0] }}" -t family:"${{ matrix.device[1] }}" -t architecture:"${{ matrix.device[2] }}" -t environment:"${{ matrix.environment }}" rootfs-device.yaml'
+
+      - name: Build image
+        run: |
+          docker exec $CONTAINER_HASH /bin/sh -c 'cd /buildd/sources; debos --disable-fakemachine -t device:"${{ matrix.device[0] }}" -t family:"${{ matrix.device[1] }}" -t architecture:"${{ matrix.device[2] }}" -t environment:"${{ matrix.environment }}" image.yaml'
+
+      - name: Build image
+        run: |
+          docker exec $CONTAINER_HASH /bin/sh -c 'cd /buildd/sources; debos --disable-fakemachine -t device:"${{ matrix.device[0] }}" -t family:"${{ matrix.device[1] }}" -t architecture:"${{ matrix.device[2] }}" -t environment:"${{ matrix.environment }}" installer.yaml'
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          path: ./*
+          if-no-files-found: error
+          retention-days: 1
+
+  prepare:
+    runs-on: ubuntu-20.04
+    name: Create GitHub release
+    needs: build
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}${{ steps.create_nightly.outputs.upload_url }}
+
+    steps:
+      - name: Free up some storage
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Delete old nightly release
+        uses: dev-drprasad/delete-tag-and-release@v0.2.1
+        if: startsWith(github.ref, 'refs/tags/cutie') != true
+        with:
+          delete_release: true # default: false
+          tag_name: nightly # tag name to delete
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag snapshot
+        if: startsWith(github.ref, 'refs/tags/cutie') != true
+        uses: tvdias/github-tagger@v0.0.1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          tag: nightly
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v3
+
+      - name: Create SHA256SUMS
+        run: |
+            sha256sum * >> SHA256SUMS
+
+      - name: Create stable release (drafted)
+        id: create_release
+        if: startsWith(github.ref, 'refs/tags/cutie')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: SHA256SUMS
+          tag_name: ${{ github.ref }}
+          draft: true
+          prerelease: false
+
+      - name: Create nightly release
+        id: create_nightly
+        if: startsWith(github.ref, 'refs/tags/cutie') != true
+        uses: softprops/action-gh-release@v1
+        with:
+          files: SHA256SUMS
+          tag_name: nightly
+          draft: false
+          prerelease: true
+
+  publish:
+    runs-on: ubuntu-20.04
+    needs: prepare
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}${{ steps.create_nightly.outputs.upload_url }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        device: [ ["pinephone", "sunxi", "arm64"] ]
+        environment: [ "phosh" ]
+
+    name: Publish ${{ matrix.device[0] }}
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v3
+
+      - name: Create stable release (drafted)
+        id: create_release
+        if: startsWith(github.ref, 'refs/tags/cutie')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ./*
+          tag_name: ${{ github.ref }}
+          draft: true
+          prerelease: false
+
+      - name: Create nightly release
+        id: create_nightly
+        if: startsWith(github.ref, 'refs/tags/cutie') != true
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ./*
+          tag_name: nightly
+          draft: false
+          prerelease: true
